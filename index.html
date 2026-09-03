@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="HANDOFF is a multiplayer ops room where humans and agents work the same support case through WebMCP tools."
+    />
+    <title>HANDOFF</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-lockup" aria-label="HANDOFF">
+          <div class="brand-mark" aria-hidden="true">
+            <span class="mark-node human-node"></span>
+            <span class="mark-line"></span>
+            <span class="mark-node agent-node"></span>
+          </div>
+          <div>
+            <h1>HANDOFF</h1>
+            <p>Multiplayer ops room for humans and agents</p>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <div id="agentPulse" class="agent-pulse" hidden>
+            <span class="pulse-dot"></span>
+            <span>AGENT WORKING</span>
+          </div>
+          <div id="webmcpBanner" class="webmcp-banner is-checking" role="status">
+            Checking WebMCP...
+          </div>
+          <button id="replayDemo" class="icon-button labeled" type="button" title="Replay demo">
+            <span aria-hidden="true">↺</span>
+            <span>Replay demo</span>
+          </button>
+        </div>
+      </header>
+
+      <main class="ops-grid">
+        <aside class="panel case-rail" aria-label="Cases">
+          <div class="panel-heading">
+            <div>
+              <h2>Cases</h2>
+              <p id="caseCount">0 active</p>
+            </div>
+          </div>
+          <div class="filter-row" role="tablist" aria-label="Case filters">
+            <button class="filter-chip is-active" type="button" data-filter="all">All</button>
+            <button class="filter-chip" type="button" data-filter="open">Open</button>
+            <button class="filter-chip" type="button" data-filter="p1">P1</button>
+            <button class="filter-chip" type="button" data-filter="approvals">Approvals</button>
+          </div>
+          <div id="caseList" class="case-list"></div>
+        </aside>
+
+        <section class="case-stage" aria-label="Case detail">
+          <section class="panel case-summary" id="caseSummary"></section>
+          <section class="panel approvals-panel">
+            <div class="panel-heading compact">
+              <div>
+                <h2>Proposed Agent Actions</h2>
+                <p>Approval-gated work stays visible before it commits.</p>
+              </div>
+            </div>
+            <div id="pendingApprovals" class="approval-list"></div>
+          </section>
+          <section class="panel draft-panel">
+            <div class="panel-heading compact">
+              <div>
+                <h2>Draft Reply</h2>
+                <p>Visible to Jordan until send is approved.</p>
+              </div>
+            </div>
+            <textarea id="draftReply" class="draft-textarea" spellcheck="true"></textarea>
+            <div class="draft-meta">
+              <span id="draftState">No draft yet</span>
+              <span id="draftChars">0 chars</span>
+            </div>
+          </section>
+        </section>
+
+        <aside class="right-stack" aria-label="Timeline and tools">
+          <section class="panel timeline-panel">
+            <div class="panel-heading compact">
+              <div>
+                <h2>Activity Timeline</h2>
+                <p>Human and agent actions on the same case.</p>
+              </div>
+            </div>
+            <ol id="timeline" class="timeline"></ol>
+          </section>
+          <section class="panel inspector-panel">
+            <div class="panel-heading compact">
+              <div>
+                <h2>WebMCP Inspector</h2>
+                <p>Registered tools and recent calls.</p>
+              </div>
+            </div>
+            <div id="registeredTools" class="tool-list"></div>
+            <div id="toolLog" class="tool-log"></div>
+          </section>
+        </aside>
+      </main>
+
+      <footer class="composer-bar" aria-label="Human composer">
+        <form id="humanComposer" class="composer-form">
+          <div class="composer-identity" aria-label="Jordan Hale">
+            <span class="avatar human">J</span>
+            <div>
+              <strong>Jordan Hale</strong>
+              <span>Support Lead</span>
+            </div>
+          </div>
+          <textarea
+            id="humanComment"
+            name="comment"
+            rows="2"
+            placeholder="Add an internal note or customer-visible comment..."
+            required
+          ></textarea>
+          <select id="commentVisibility" name="visibility" aria-label="Comment visibility">
+            <option value="internal">Internal</option>
+            <option value="public_to_customer">Public note</option>
+          </select>
+          <button class="primary-button" type="submit">Post</button>
+        </form>
+        <div class="agent-asks" aria-label="Ask agent to">
+          <span>Ask agent to...</span>
+          <button type="button" data-agent-ask="Inspect CASE-1042 with get_case, then summarize the next safe step.">
+            inspect case
+          </button>
+          <button type="button" data-agent-ask="Draft an apologetic customer reply for CASE-1042.">
+            draft apology
+          </button>
+          <button type="button" data-agent-ask="Propose a 2388 USD refund for CASE-1042 because it was a duplicate annual charge.">
+            propose refund
+          </button>
+          <button type="button" data-agent-ask="Send the current customer reply for CASE-1042 after Jordan approves it.">
+            send reply
+          </button>
+          <output id="askStatus" aria-live="polite"></output>
+        </div>
+      </footer>
+    </div>
+
+    <div id="approvalModal" class="modal-backdrop" hidden>
+      <section class="approval-modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+        <div class="modal-accent" aria-hidden="true"></div>
+        <h2 id="modalTitle">Human approval required</h2>
+        <p id="modalBody"></p>
+        <dl id="modalDetails" class="modal-details"></dl>
+        <div class="modal-actions">
+          <button id="modalReject" class="secondary-button danger" type="button">Reject</button>
+          <button id="modalApprove" class="primary-button" type="button">Approve</button>
+        </div>
+      </section>
+    </div>
+  </body>
+</html>
