@@ -33,9 +33,9 @@
           <div id="webmcpBanner" class="webmcp-banner is-checking" role="status">
             Checking WebMCP...
           </div>
-          <button id="replayDemo" class="icon-button labeled" type="button" title="Replay demo">
+          <button id="replayDemo" class="icon-button labeled" type="button" title="Reset demo">
             <span aria-hidden="true">↺</span>
-            <span>Replay demo</span>
+            <span>Reset demo</span>
           </button>
         </div>
       </header>
@@ -102,6 +102,17 @@
             </div>
             <div id="registeredTools" class="tool-list"></div>
             <div id="toolLog" class="tool-log"></div>
+            <details id="judgeConsole" class="judge-console">
+              <summary>Judge console</summary>
+              <dl>
+                <dt>modelContext present</dt>
+                <dd id="judgeModelContext">checking</dd>
+                <dt>registered tool names</dt>
+                <dd id="judgeRegisteredTools">none</dd>
+                <dt>last tool call</dt>
+                <dd id="judgeLastToolCall">none</dd>
+              </dl>
+            </details>
           </section>
         </aside>
       </main>

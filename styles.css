@@ -780,6 +780,38 @@ select:focus-visible {
   white-space: pre-wrap;
 }
 
+.judge-console {
+  margin: 0 12px 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.judge-console summary {
+  min-height: 28px;
+  cursor: pointer;
+  color: #bfd0e1;
+}
+
+.judge-console dl {
+  display: grid;
+  grid-template-columns: 118px minmax(0, 1fr);
+  gap: 6px 8px;
+  margin: 4px 0 0;
+}
+
+.judge-console dt {
+  color: var(--subtle);
+}
+
+.judge-console dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
 .composer-bar {
   position: fixed;
   right: 0;

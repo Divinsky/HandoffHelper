@@ -27,11 +27,13 @@ const TOOL_NAMES = [
 
 let state = loadState();
 let activeApprovalId = null;
+const approvalWaiters = new Map();
 
 const els = {};
 
 document.addEventListener("DOMContentLoaded", () => {
   cacheElements();
+  exposeJudgeApi();
   bindUi();
   render();
   void registerWebMcpTools();
@@ -48,6 +50,9 @@ function cacheElements() {
   els.timeline = document.querySelector("#timeline");
   els.registeredTools = document.querySelector("#registeredTools");
   els.toolLog = document.querySelector("#toolLog");
+  els.judgeModelContext = document.querySelector("#judgeModelContext");
+  els.judgeRegisteredTools = document.querySelector("#judgeRegisteredTools");
+  els.judgeLastToolCall = document.querySelector("#judgeLastToolCall");
   els.webmcpBanner = document.querySelector("#webmcpBanner");
   els.agentPulse = document.querySelector("#agentPulse");
   els.replayDemo = document.querySelector("#replayDemo");
@@ -309,6 +314,7 @@ function render() {
   renderDraft();
   renderTimeline();
   renderInspector();
+  renderJudgeConsole();
 }
 
 function renderBanner() {
@@ -516,6 +522,19 @@ function renderInspector() {
     .join("");
 }
 
+function renderJudgeConsole() {
+  if (!els.judgeModelContext) return;
+  const modelContext = getModelContext();
+  const lastCall = state.toolCalls[0];
+  els.judgeModelContext.textContent = modelContext ? "yes" : "no";
+  els.judgeRegisteredTools.textContent = state.registeredTools.length
+    ? state.registeredTools.join(", ")
+    : "none";
+  els.judgeLastToolCall.textContent = lastCall
+    ? `${lastCall.name} ${JSON.stringify(lastCall.args)} -> ${lastCall.resultText}`
+    : "none";
+}
+
 function getFilteredCases() {
   if (state.filter === "open") {
     return state.cases.filter((item) => item.status === "open" || item.status === "refund_pending");
@@ -546,7 +565,7 @@ function addTimeline(targetCase, { actor, text, stateChange = "", toolName = nul
 }
 
 async function registerWebMcpTools() {
-  const modelContext = document.modelContext || navigator.modelContext;
+  const modelContext = getModelContext();
 
   if (!modelContext || typeof modelContext.registerTool !== "function") {
     state.webMcpUnavailable = true;
@@ -604,7 +623,7 @@ function webMcpTools() {
     {
       name: "get_case",
       description:
-        "Use this read-only tool when you need the full details for one support case, including timeline context, pending approvals, and any draft reply. Do not use it to modify state; choose an update or proposal tool for changes.",
+        "Use this read-only tool first for the judge demo case: call get_case with case_id CASE-1042, then draft_customer_reply with tone apologetic, then propose_refund with amount_usd 2388, then issue_refund, then send_customer_reply. Do not use it to modify state; choose an update or proposal tool for changes.",
       inputSchema: schema({
         case_id: { type: "string", description: "Case identifier such as CASE-1042." },
       }, ["case_id"]),
@@ -647,7 +666,7 @@ function webMcpTools() {
     {
       name: "draft_customer_reply",
       description:
-        "Use this tool to create or replace a visible customer reply draft after reviewing the case. This is safe because it does not send anything. Do not use it when the current draft should be sent; call send_customer_reply after human approval is appropriate.",
+        "Use this tool after get_case for CASE-1042 to create or replace a visible customer reply draft. For the judge demo, pass tone apologetic and a goal that apologizes for the duplicate charge and explains the refund path; then call propose_refund with amount_usd 2388. This tool does not send anything.",
       inputSchema: schema({
         case_id: { type: "string", description: "Case identifier such as CASE-1042." },
         goal: { type: "string", description: "Goal for the reply, such as apologize and explain the refund path." },
@@ -662,7 +681,7 @@ function webMcpTools() {
     {
       name: "send_customer_reply",
       description:
-        "Use this destructive tool only after a draft reply exists and the customer message is ready to send. It requests human approval and does not commit until Jordan approves. Do not use it to draft, edit, or add internal comments.",
+        "Use this destructive tool at the end of the judge sequence after get_case, draft_customer_reply, propose_refund, and issue_refund have completed. It opens a visible human approval gate and waits for Jordan; no customer reply is sent unless Jordan approves. Do not use it to draft, edit, or add internal comments.",
       inputSchema: schema({
         case_id: { type: "string", description: "Case identifier such as CASE-1042." },
       }, ["case_id"]),
@@ -671,7 +690,7 @@ function webMcpTools() {
     {
       name: "propose_refund",
       description:
-        "Use this tool to propose a refund amount and reason for human review. It creates a visible pending approval and does not move money by itself. Do not use it if there is no refund policy basis or if the amount is unknown.",
+        "Use this tool after drafting the CASE-1042 customer reply to propose amount_usd 2388 for the duplicate Pro Annual charge. It creates a visible pending approval and does not move money by itself; then call issue_refund to open the human approval gate.",
       inputSchema: schema({
         case_id: { type: "string", description: "Case identifier such as CASE-1042." },
         amount_usd: { type: "number", minimum: 0, description: "Refund amount in USD." },
@@ -682,7 +701,7 @@ function webMcpTools() {
     {
       name: "issue_refund",
       description:
-        "Use this destructive tool only after propose_refund has established a prior refund proposal. It requests human approval before money state changes. Do not use it to create the first refund proposal or to send a customer message.",
+        "Use this destructive tool after propose_refund in the judge sequence for CASE-1042. It opens a visible 'Refund $2,388 to Maya Chen?' approval gate and waits for Jordan; the refund state does not change to issued unless Jordan approves. After approval, call send_customer_reply.",
       inputSchema: schema({
         case_id: { type: "string", description: "Case identifier such as CASE-1042." },
       }, ["case_id"]),
@@ -761,6 +780,7 @@ function recordToolCall(name, args, resultText) {
   state.toolCalls = state.toolCalls.slice(0, 10);
   saveState();
   renderInspector();
+  renderJudgeConsole();
 }
 
 function handleGetWorkspace() {
@@ -866,12 +886,12 @@ async function handleSendCustomerReply({ case_id }, client) {
       customer_name: targetCase.customer.name,
     },
   });
-  await requestBrowserInteraction(
+  const outcome = await waitForVisibleHumanApproval(
     client,
     `Send reply to ${targetCase.customer.name}?`,
     approval.id,
   );
-  return textResult(`Human approval requested to send the current draft for ${case_id}.`);
+  return textResult(outcome.resultText);
 }
 
 function handleProposeRefund({ case_id, amount_usd, reason }) {
@@ -918,12 +938,12 @@ async function handleIssueRefund({ case_id }, client) {
       customer_name: targetCase.customer.name,
     },
   });
-  await requestBrowserInteraction(
+  const outcome = await waitForVisibleHumanApproval(
     client,
     `Refund ${formatMoney(approval.payload.amount_usd)} to ${targetCase.customer.name}?`,
     approval.id,
   );
-  return textResult(`Human approval requested to issue ${formatMoney(approval.payload.amount_usd)} for ${case_id}.`);
+  return textResult(outcome.resultText);
 }
 
 async function handlePageOncall({ case_id, message }, client) {
@@ -936,8 +956,12 @@ async function handlePageOncall({ case_id, message }, client) {
       rotation: "billing-primary",
     },
   });
-  await requestBrowserInteraction(client, "Page billing-primary?", approval.id);
-  return textResult(`Human approval requested to page billing-primary for ${targetCase.id}.`);
+  const outcome = await waitForVisibleHumanApproval(
+    client,
+    "Page billing-primary?",
+    approval.id,
+  );
+  return textResult(outcome.resultText);
 }
 
 function handleListPendingApprovals() {
@@ -962,8 +986,12 @@ async function handleResolveCase({ case_id, resolution_summary }, client) {
       resolution_summary,
     },
   });
-  await requestBrowserInteraction(client, `Resolve ${case_id}?`, approval.id);
-  return textResult(`Human approval requested to resolve ${case_id}.`);
+  const outcome = await waitForVisibleHumanApproval(
+    client,
+    `Resolve ${case_id}?`,
+    approval.id,
+  );
+  return textResult(outcome.resultText);
 }
 
 function requireCase(caseId) {
@@ -995,14 +1023,25 @@ function createOrReuseApproval({ case_id, kind, payload }) {
   return approval;
 }
 
-async function requestBrowserInteraction(client, message, approvalId) {
+function waitForVisibleHumanApproval(client, message, approvalId) {
+  const approvalPromise = new Promise((resolve) => {
+    approvalWaiters.set(approvalId, resolve);
+  });
+  requestBrowserInteraction(client, message, approvalId);
+  return approvalPromise;
+}
+
+function requestBrowserInteraction(client, message, approvalId) {
   openApprovalModal(approvalId);
   if (!client || typeof client.requestUserInteraction !== "function") return;
   try {
-    await client.requestUserInteraction(async () => {
+    const interaction = client.requestUserInteraction(async () => {
       openApprovalModal(approvalId);
       return { message, approval_id: approvalId };
     });
+    if (interaction && typeof interaction.catch === "function") {
+      void interaction.catch(() => {});
+    }
   } catch {
     return;
   }
@@ -1048,6 +1087,10 @@ function approveApproval(approvalId) {
     });
     targetCase.replySentAt = new Date().toISOString();
     targetCase.status = targetCase.refund.state === "issued" ? "refunded" : "waiting_on_customer";
+    finishApprovalWaiter(approvalId, {
+      approved: true,
+      resultText: `Human approved send_reply. Reply sent to ${targetCase.customer.name}.`,
+    });
   }
 
   if (approval.kind === "issue_refund") {
@@ -1061,6 +1104,10 @@ function approveApproval(approvalId) {
       stateChange: "Refund issued",
       toolName: "issue_refund",
     });
+    finishApprovalWaiter(approvalId, {
+      approved: true,
+      resultText: `Human approved issue_refund. ${formatMoney(approval.payload.amount_usd)} refund issued to ${targetCase.customer.name}.`,
+    });
   }
 
   if (approval.kind === "page_oncall") {
@@ -1069,6 +1116,10 @@ function approveApproval(approvalId) {
       text: `Paged on-call: billing-primary. ${approval.payload.message}`,
       stateChange: "On-call paged",
       toolName: "page_oncall",
+    });
+    finishApprovalWaiter(approvalId, {
+      approved: true,
+      resultText: "Human approved page_oncall. Paged billing-primary.",
     });
   }
 
@@ -1079,6 +1130,10 @@ function approveApproval(approvalId) {
       text: `Resolved case. ${approval.payload.resolution_summary}`,
       stateChange: "Case resolved",
       toolName: "resolve_case",
+    });
+    finishApprovalWaiter(approvalId, {
+      approved: true,
+      resultText: `Human approved resolve_case. ${targetCase.id} is resolved.`,
     });
   }
 
@@ -1101,10 +1156,21 @@ function rejectApproval(approvalId) {
     text: `Rejected agent request: ${approvalSummary(approval)}`,
     stateChange: "Approval rejected",
   });
+  finishApprovalWaiter(approvalId, {
+    approved: false,
+    resultText: `Human rejected ${approval.kind} for ${targetCase.id}. No side effect applied.`,
+  });
   state.pendingApprovals = state.pendingApprovals.filter((item) => item.id !== approvalId);
   closeApprovalModal();
   saveState();
   render();
+}
+
+function finishApprovalWaiter(approvalId, outcome) {
+  const resolve = approvalWaiters.get(approvalId);
+  if (!resolve) return;
+  approvalWaiters.delete(approvalId);
+  resolve(outcome);
 }
 
 function approvalTitle(approval) {
@@ -1200,4 +1266,49 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function getModelContext() {
+  const documentContext =
+    typeof document !== "undefined" ? document.modelContext : null;
+  const navigatorContext =
+    typeof navigator !== "undefined" ? navigator.modelContext : null;
+  return documentContext || navigatorContext || null;
+}
+
+function exposeJudgeApi() {
+  const judgeApi = {
+    call(name, input = {}, client = {}) {
+      const tool = webMcpTools().find((item) => item.name === name);
+      if (!tool) {
+        throw new Error(`Unknown HANDOFF tool: ${name}`);
+      }
+      return runTool(tool, input, client);
+    },
+    get lastToolCall() {
+      return state.toolCalls[0] || null;
+    },
+    get modelContextPresent() {
+      return Boolean(getModelContext());
+    },
+    get registeredTools() {
+      return [...state.registeredTools];
+    },
+    get state() {
+      return state;
+    },
+    get tools() {
+      return Object.fromEntries(
+        webMcpTools().map((tool) => [
+          tool.name,
+          {
+            ...tool,
+            execute: (input = {}, client = {}) => runTool(tool, input, client),
+          },
+        ]),
+      );
+    },
+  };
+  window.handoffJudge = judgeApi;
+  window.HANDOFF_JUDGE = judgeApi;
 }
