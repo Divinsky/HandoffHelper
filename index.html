@@ -7,6 +7,16 @@
       name="description"
       content="HANDOFF is a multiplayer ops room where humans and agents work the same support case through WebMCP tools."
     />
+    <meta name="theme-color" content="#0b0f14" />
+    <meta property="og:title" content="HANDOFF" />
+    <meta
+      property="og:description"
+      content="A WebMCP-enabled support ops room where agents act through structured tools and humans approve consequential work."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://handoffhelper.com/" />
+    <meta name="twitter:card" content="summary" />
+    <link rel="canonical" href="https://handoffhelper.com/" />
     <title>HANDOFF</title>
     <link rel="stylesheet" href="./styles.css" />
     <script type="module" src="./app.js"></script>
@@ -48,6 +58,7 @@
               <p id="caseCount">0 active</p>
             </div>
           </div>
+          <div id="presenceRail" class="presence-rail" aria-label="Live session presence"></div>
           <div class="filter-row" role="tablist" aria-label="Case filters">
             <button class="filter-chip is-active" type="button" data-filter="all">All</button>
             <button class="filter-chip" type="button" data-filter="open">Open</button>
@@ -58,6 +69,7 @@
         </aside>
 
         <section class="case-stage" aria-label="Case detail">
+          <section class="panel session-panel" id="liveSession" aria-label="Live agent session"></section>
           <section class="panel case-summary" id="caseSummary"></section>
           <section class="panel approvals-panel">
             <div class="panel-heading compact">
@@ -131,7 +143,6 @@
             name="comment"
             rows="2"
             placeholder="Add an internal note or customer-visible comment..."
-            required
           ></textarea>
           <select id="commentVisibility" name="visibility" aria-label="Comment visibility">
             <option value="internal">Internal</option>
@@ -141,16 +152,16 @@
         </form>
         <div class="agent-asks" aria-label="Ask agent to">
           <span>Ask agent to...</span>
-          <button type="button" data-agent-ask="Inspect CASE-1042 with get_case, then summarize the next safe step.">
+          <button type="button" data-agent-tool="inspect_case" data-agent-ask="Inspect CASE-1042 with get_case, then summarize the next safe step.">
             inspect case
           </button>
-          <button type="button" data-agent-ask="Draft an apologetic customer reply for CASE-1042.">
+          <button type="button" data-agent-tool="draft_apology" data-agent-ask="Draft an apologetic customer reply for CASE-1042.">
             draft apology
           </button>
-          <button type="button" data-agent-ask="Propose a 2388 USD refund for CASE-1042 because it was a duplicate annual charge.">
+          <button type="button" data-agent-tool="propose_refund" data-agent-ask="Propose a 2388 USD refund for CASE-1042 because it was a duplicate annual charge.">
             propose refund
           </button>
-          <button type="button" data-agent-ask="Send the current customer reply for CASE-1042 after Jordan approves it.">
+          <button type="button" data-agent-tool="send_reply" data-agent-ask="Send the current customer reply for CASE-1042 after Jordan approves it.">
             send reply
           </button>
           <output id="askStatus" aria-live="polite"></output>

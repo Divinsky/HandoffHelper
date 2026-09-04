@@ -1,6 +1,10 @@
 const STORAGE_KEY = "handoff.v1";
 const HUMAN = { id: "human", name: "Jordan Hale", role: "Support Lead", initial: "J" };
 const AGENT = { id: "agent", name: "Handoff", role: "Ops agent", initial: "H" };
+const PARTICIPANTS = {
+  jordan: { id: "jordan", name: "Jordan Hale", role: "Support Lead", initial: "J" },
+  sam: { id: "sam", name: "Sam Chen", role: "Support", initial: "S" },
+};
 
 const STATUS_OPTIONS = [
   "open",
@@ -23,6 +27,10 @@ const TOOL_NAMES = [
   "page_oncall",
   "list_pending_approvals",
   "resolve_case",
+  "get_session",
+  "list_watchers",
+  "redirect_agent",
+  "handoff_session",
 ];
 
 let state = loadState();
@@ -41,6 +49,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
 function cacheElements() {
   els.caseCount = document.querySelector("#caseCount");
+  els.presenceRail = document.querySelector("#presenceRail");
+  els.liveSession = document.querySelector("#liveSession");
   els.caseList = document.querySelector("#caseList");
   els.caseSummary = document.querySelector("#caseSummary");
   els.pendingApprovals = document.querySelector("#pendingApprovals");
@@ -122,7 +132,11 @@ function bindUi() {
   els.humanComposer.addEventListener("submit", (event) => {
     event.preventDefault();
     const body = els.humanComment.value.trim();
-    if (!body) return;
+    if (!body) {
+      els.humanComment.placeholder = "Add a note before posting...";
+      els.humanComment.focus();
+      return;
+    }
     const selectedCase = getSelectedCase();
     addTimeline(selectedCase, {
       actor: "human",
@@ -136,18 +150,23 @@ function bindUi() {
 
   document.querySelectorAll("[data-agent-ask]").forEach((button) => {
     button.addEventListener("click", async () => {
-      const prompt = button.dataset.agentAsk;
-      els.humanComment.value = prompt;
-      els.humanComment.focus();
+      const selectedCase = getSelectedCase();
+      const action = button.dataset.agentTool || button.dataset.agentAsk;
+      const toolCall = agentAskToToolCall(action, selectedCase);
+      if (!toolCall) {
+        els.askStatus.textContent = "Unavailable";
+        return;
+      }
+      els.askStatus.textContent = `Running ${toolCall.name}`;
       try {
-        await navigator.clipboard.writeText(prompt);
-        els.askStatus.textContent = "Copied";
-      } catch {
-        els.askStatus.textContent = "Ready";
+        const result = await callLocalTool(toolCall.name, toolCall.input);
+        els.askStatus.textContent = getResultText(result).replace(/^Error:\s*/, "") || "Done";
+      } catch (error) {
+        els.askStatus.textContent = error.message || "Tool failed";
       }
       window.setTimeout(() => {
         els.askStatus.textContent = "";
-      }, 1800);
+      }, 2800);
     });
   });
 
@@ -169,6 +188,24 @@ function bindUi() {
       closeApprovalModal();
     }
   });
+
+  [els.presenceRail, els.liveSession].forEach((container) => {
+    container.addEventListener("click", handleSessionActionClick);
+  });
+}
+
+function handleSessionActionClick(event) {
+  const action = event.target.closest("[data-session-action]");
+  if (!action) return;
+  if (action.dataset.sessionAction === "join-sam") {
+    joinSessionAsSam();
+  }
+  if (action.dataset.sessionAction === "redirect") {
+    redirectAgentFromPrompt();
+  }
+  if (action.dataset.sessionAction === "handoff-sam") {
+    handoffSessionTo("sam");
+  }
 }
 
 function createSeedState() {
@@ -178,6 +215,7 @@ function createSeedState() {
     registeredTools: [],
     toolCalls: [],
     pendingApprovals: [],
+    session: createSeedSession(),
     cases: [
       {
         id: "CASE-1042",
@@ -271,12 +309,58 @@ function createSeedState() {
   };
 }
 
-function event(actor, text, stateChange, at, toolName = null, id = null) {
+function createSeedSession() {
+  return {
+    id: "SES-1042",
+    case_id: "CASE-1042",
+    status: "running",
+    owner: "jordan",
+    watchers: [],
+    agentState: "working",
+    elapsedLabel: "running 14m",
+    currentStepId: "propose_refund",
+    lastRedirectInstruction: "",
+  };
+}
+
+function normalizeSession(session) {
+  const seed = createSeedSession();
+  if (!session || typeof session !== "object") return seed;
+  const owner = PARTICIPANTS[session.owner] ? session.owner : seed.owner;
+  const status = ["running", "redirected", "handed_off", "waiting_on_human"].includes(session.status)
+    ? session.status
+    : seed.status;
+  const currentStepId = ["inspect", "draft_apology", "propose_refund", "wait_human"].includes(session.currentStepId)
+    ? session.currentStepId
+    : seed.currentStepId;
+  const watchers = Array.isArray(session.watchers)
+    ? [...new Set(session.watchers.filter((id) => PARTICIPANTS[id] && id !== owner))]
+    : seed.watchers;
+  return {
+    ...seed,
+    ...session,
+    case_id: "CASE-1042",
+    status,
+    owner,
+    watchers,
+    agentState: session.agentState === "idle" ? "idle" : "working",
+    currentStepId,
+    lastRedirectInstruction:
+      typeof session.lastRedirectInstruction === "string" ? session.lastRedirectInstruction : "",
+  };
+}
+
+function event(actor, text, stateChange, at, toolName = null, id = null, identity = null) {
+  const actorProfile =
+    actor === "agent"
+      ? AGENT
+      : identity || HUMAN;
   return {
     id: id || crypto.randomUUID(),
     actor,
-    actorName: actor === "agent" ? AGENT.name : HUMAN.name,
-    role: actor === "agent" ? AGENT.role : HUMAN.role,
+    actorName: actorProfile.name,
+    role: actorProfile.role,
+    actorInitial: actorProfile.initial,
     text,
     stateChange,
     at,
@@ -290,10 +374,16 @@ function loadState() {
     if (!raw) return createSeedState();
     const parsed = JSON.parse(raw);
     if (!parsed.cases || !Array.isArray(parsed.cases)) return createSeedState();
+    const seed = createSeedState();
+    const registeredTools =
+      Array.isArray(parsed.registeredTools) && parsed.registeredTools.length === TOOL_NAMES.length
+        ? parsed.registeredTools
+        : [];
     return {
-      ...createSeedState(),
+      ...seed,
       ...parsed,
-      registeredTools: Array.isArray(parsed.registeredTools) ? parsed.registeredTools : [],
+      session: normalizeSession(parsed.session),
+      registeredTools,
       toolCalls: Array.isArray(parsed.toolCalls) ? parsed.toolCalls : [],
       pendingApprovals: Array.isArray(parsed.pendingApprovals) ? parsed.pendingApprovals : [],
     };
@@ -308,7 +398,9 @@ function saveState() {
 
 function render() {
   renderBanner();
+  renderPresenceRail();
   renderCaseList();
+  renderLiveSession();
   renderCaseSummary();
   renderApprovals();
   renderDraft();
@@ -331,6 +423,60 @@ function renderBanner() {
     els.webmcpBanner.textContent = "Checking WebMCP...";
     els.webmcpBanner.classList.add("is-checking");
   }
+}
+
+function renderPresenceRail() {
+  const session = getSession();
+  const rows = [
+    presenceRow(PARTICIPANTS.jordan),
+    presenceRow(PARTICIPANTS.sam),
+    {
+      name: AGENT.name,
+      role: "agent",
+      badges: [session.agentState === "working" ? "working" : "idle"],
+      initial: AGENT.initial,
+      className: "agent",
+      action: "",
+    },
+  ];
+  els.presenceRail.innerHTML = rows
+    .map(
+      (row) => `
+        <div class="presence-person">
+          <span class="avatar ${row.className}">${escapeHtml(row.initial)}</span>
+          <span class="presence-copy">
+            <strong>${escapeHtml(row.name)}</strong>
+            <span>${escapeHtml(row.role)}</span>
+          </span>
+          <span class="presence-badges">
+            ${row.badges.map((badge) => `<span class="session-badge">${escapeHtml(badge)}</span>`).join("")}
+          </span>
+          ${row.action}
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function presenceRow(participant) {
+  const session = getSession();
+  const isOwner = session.owner === participant.id;
+  const isWatcher = session.watchers.includes(participant.id);
+  const badges = [];
+  if (isOwner) badges.push("owner", "steering");
+  if (isWatcher) badges.push("watching");
+  const action =
+    participant.id === "sam" && !isOwner && !isWatcher
+      ? '<button type="button" data-session-action="join-sam">Join as Sam</button>'
+      : "";
+  return {
+    name: participant.name,
+    role: isOwner ? `${participant.role} - session owner` : participant.role,
+    badges,
+    initial: participant.initial,
+    className: "human",
+    action,
+  };
 }
 
 function renderCaseList() {
@@ -365,6 +511,52 @@ function renderCaseList() {
   if (filteredCases.length === 0) {
     els.caseList.innerHTML = '<div class="empty-state">No cases match this filter.</div>';
   }
+}
+
+function renderLiveSession() {
+  const session = getSession();
+  const owner = getParticipant(session.owner);
+  const watchers = getWatcherNames();
+  const steps = getSessionPlanSteps();
+  const canJoinSam = session.owner !== "sam" && !session.watchers.includes("sam");
+  els.liveSession.innerHTML = `
+    <div class="panel-heading compact">
+      <div>
+        <h2>Live agent session</h2>
+        <p>Teammates can watch, redirect, and hand off the same agent run.</p>
+      </div>
+      <span class="session-id">${escapeHtml(session.id)}</span>
+    </div>
+    <div class="session-body">
+      <div class="session-facts">
+        <span><strong>Status</strong>${escapeHtml(formatSessionStatus(session.status))}</span>
+        <span><strong>Owner</strong>${escapeHtml(owner.name)}</span>
+        <span><strong>Elapsed</strong>${escapeHtml(session.elapsedLabel)}</span>
+      </div>
+      <ol class="session-plan" aria-label="Current plan steps">
+        ${steps
+          .map(
+            (step) => `
+              <li class="${step.id === session.currentStepId ? "is-current" : ""} ${step.state}">
+                <span>${escapeHtml(step.label)}</span>
+                <small>${escapeHtml(step.state)}</small>
+              </li>
+            `,
+          )
+          .join("")}
+      </ol>
+      <div class="session-watchers">
+        <strong>Watchers</strong>
+        <span>${escapeHtml(watchers.length ? watchers.join(", ") : "none yet")}</span>
+      </div>
+      ${session.lastRedirectInstruction ? `<p class="session-redirect">Redirect: ${escapeHtml(session.lastRedirectInstruction)}</p>` : ""}
+      <div class="session-actions">
+        <button class="secondary-button" type="button" data-session-action="join-sam" ${canJoinSam ? "" : "disabled"}>Join as Sam</button>
+        <button class="secondary-button" type="button" data-session-action="redirect">Redirect...</button>
+        <button class="primary-button" type="button" data-session-action="handoff-sam" ${session.owner === "sam" ? "disabled" : ""}>Hand off to Sam</button>
+      </div>
+    </div>
+  `;
 }
 
 function renderCaseSummary() {
@@ -475,7 +667,7 @@ function renderTimeline() {
   els.timeline.innerHTML = events
     .map((item) => {
       const identityClass = item.actor === "agent" ? "agent" : "human";
-      const initial = item.actor === "agent" ? AGENT.initial : HUMAN.initial;
+      const initial = item.actorInitial || (item.actor === "agent" ? AGENT.initial : HUMAN.initial);
       return `
         <li class="timeline-event">
           <span class="avatar ${identityClass}">${initial}</span>
@@ -526,10 +718,9 @@ function renderJudgeConsole() {
   if (!els.judgeModelContext) return;
   const modelContext = getModelContext();
   const lastCall = state.toolCalls[0];
+  const toolNames = state.registeredTools.length ? state.registeredTools : TOOL_NAMES;
   els.judgeModelContext.textContent = modelContext ? "yes" : "no";
-  els.judgeRegisteredTools.textContent = state.registeredTools.length
-    ? state.registeredTools.join(", ")
-    : "none";
+  els.judgeRegisteredTools.textContent = toolNames.join(", ");
   els.judgeLastToolCall.textContent = lastCall
     ? `${lastCall.name} ${JSON.stringify(lastCall.args)} -> ${lastCall.resultText}`
     : "none";
@@ -550,6 +741,80 @@ function getFilteredCases() {
   return state.cases;
 }
 
+function getSessionPlanSteps() {
+  const session = getSession();
+  const selectedCase = getCase(session.case_id) || getSelectedCase();
+  const hasDraft = Boolean(selectedCase.draftReply && selectedCase.draftReply.trim());
+  const hasPendingRefund = state.pendingApprovals.some(
+    (approval) => approval.case_id === selectedCase.id && approval.kind === "issue_refund",
+  );
+  const currentId = hasPendingRefund || session.status === "waiting_on_human"
+    ? "wait_human"
+    : session.currentStepId;
+  return [
+    { id: "inspect", label: "Inspect", state: currentId === "inspect" ? "current" : "done" },
+    {
+      id: "draft_apology",
+      label: "Draft apology",
+      state: currentId === "draft_apology" ? "current" : hasDraft ? "done" : "queued",
+    },
+    {
+      id: "propose_refund",
+      label: "Propose refund",
+      state: currentId === "propose_refund" ? "current" : hasPendingRefund ? "done" : "queued",
+    },
+    {
+      id: "wait_human",
+      label: "Wait for human",
+      state: currentId === "wait_human" ? "current" : "queued",
+    },
+  ];
+}
+
+function agentAskToToolCall(action, selectedCase) {
+  if (action === "inspect_case" || action.includes("Inspect")) {
+    return {
+      name: "get_case",
+      input: { case_id: selectedCase.id },
+    };
+  }
+  if (action === "draft_apology" || action.includes("Draft")) {
+    return {
+      name: "draft_customer_reply",
+      input: {
+        case_id: selectedCase.id,
+        goal: "Apologize for the duplicate charge and explain the refund approval path.",
+        tone: "apologetic",
+      },
+    };
+  }
+  if (action === "propose_refund" || action.includes("Propose")) {
+    return {
+      name: "propose_refund",
+      input: {
+        case_id: selectedCase.id,
+        amount_usd: 2388,
+        reason: "Duplicate Pro Annual charge after failed webhook retry.",
+      },
+    };
+  }
+  if (action === "send_reply" || action.includes("Send")) {
+    return {
+      name: "send_customer_reply",
+      input: { case_id: selectedCase.id },
+    };
+  }
+  return null;
+}
+
+function callLocalTool(name, input = {}, client = {}) {
+  const tool = webMcpTools().find((item) => item.name === name);
+  if (!tool) {
+    throw new Error(`Unknown HANDOFF tool: ${name}`);
+  }
+  return runTool(tool, input, client);
+}
+
 function getSelectedCase() {
   return getCase(state.selectedCaseId) || state.cases[0];
 }
@@ -558,10 +823,142 @@ function getCase(caseId) {
   return state.cases.find((item) => item.id === caseId);
 }
 
-function addTimeline(targetCase, { actor, text, stateChange = "", toolName = null }) {
+function getSession() {
+  state.session = normalizeSession(state.session);
+  return state.session;
+}
+
+function getParticipant(participantId) {
+  return PARTICIPANTS[participantId] || PARTICIPANTS.jordan;
+}
+
+function getWatcherNames() {
+  return getSession().watchers.map((id) => getParticipant(id).name);
+}
+
+function getActiveParticipant() {
+  return getParticipant(getSession().owner);
+}
+
+function sessionSnapshot() {
+  const session = getSession();
+  const owner = getParticipant(session.owner);
+  return {
+    id: session.id,
+    case_id: session.case_id,
+    status: session.status,
+    owner,
+    agent: {
+      name: AGENT.name,
+      role: "agent",
+      state: session.agentState,
+    },
+    watchers: session.watchers.map((id) => getParticipant(id)),
+    elapsed: session.elapsedLabel,
+    current_step: session.currentStepId,
+    plan: getSessionPlanSteps(),
+    last_redirect_instruction: session.lastRedirectInstruction,
+  };
+}
+
+function addTimeline(targetCase, { actor, text, stateChange = "", toolName = null, identity = null }) {
   targetCase.timeline.push(
-    event(actor, text, stateChange, new Date().toISOString(), toolName),
+    event(actor, text, stateChange, new Date().toISOString(), toolName, null, identity),
   );
+}
+
+function addSessionTimeline({ participantId, text, stateChange, toolName = null }) {
+  addTimeline(getCase(getSession().case_id) || getSelectedCase(), {
+    actor: "human",
+    identity: getParticipant(participantId),
+    text,
+    stateChange,
+    toolName,
+  });
+}
+
+function joinSessionAsSam() {
+  const result = joinSessionWatcher("sam", "sam");
+  els.askStatus.textContent = result;
+  window.setTimeout(() => {
+    els.askStatus.textContent = "";
+  }, 2400);
+  saveState();
+  render();
+}
+
+function joinSessionWatcher(participantId, actorId) {
+  const session = getSession();
+  const participant = getParticipant(participantId);
+  if (session.owner === participantId) {
+    return `${participant.name} already owns ${session.id}.`;
+  }
+  if (!session.watchers.includes(participantId)) {
+    session.watchers.push(participantId);
+    addSessionTimeline({
+      participantId: actorId,
+      text: `${participant.name} joined ${session.id} as a watcher.`,
+      stateChange: "Session watcher joined",
+    });
+    return `${participant.name} is now watching ${session.id}.`;
+  }
+  return `${participant.name} is already watching ${session.id}.`;
+}
+
+function redirectAgentFromPrompt() {
+  const instruction = window.prompt("Redirect Handoff with a short instruction:");
+  if (!instruction || !instruction.trim()) return;
+  const result = redirectAgentSession(instruction, getSession().owner, null);
+  els.askStatus.textContent = result;
+  window.setTimeout(() => {
+    els.askStatus.textContent = "";
+  }, 2400);
+  saveState();
+  render();
+}
+
+function redirectAgentSession(instruction, participantId, toolName) {
+  const session = getSession();
+  const trimmedInstruction = instruction.trim();
+  if (!trimmedInstruction) {
+    return "Error: instruction is required.";
+  }
+  const actor = getParticipant(participantId);
+  session.status = "redirected";
+  session.agentState = "working";
+  session.lastRedirectInstruction = trimmedInstruction;
+  addSessionTimeline({
+    participantId: actor.id,
+    text: `${actor.name} redirected Handoff: ${trimmedInstruction}`,
+    stateChange: "Session redirected",
+    toolName,
+  });
+  return `${session.id} redirected: ${trimmedInstruction}`;
+}
+
+function handoffSessionTo(participantId, toolName = null) {
+  const session = getSession();
+  const nextOwner = getParticipant(participantId);
+  const previousOwnerId = session.owner;
+  const previousOwner = getParticipant(previousOwnerId);
+  if (previousOwnerId === participantId) {
+    return `${nextOwner.name} already owns ${session.id}.`;
+  }
+  session.owner = participantId;
+  session.status = "handed_off";
+  session.agentState = "working";
+  session.watchers = session.watchers
+    .filter((id) => id !== participantId && id !== previousOwnerId);
+  session.watchers.push(previousOwnerId);
+  addSessionTimeline({
+    participantId: previousOwnerId,
+    text: `${previousOwner.name} handed ${session.id} to ${nextOwner.name}. ${previousOwner.name} is now watching.`,
+    stateChange: "Session handed off",
+    toolName,
+  });
+  saveState();
+  render();
+  return `${session.id} owner is now ${nextOwner.name}.`;
 }
 
 async function registerWebMcpTools() {
@@ -617,7 +1014,7 @@ function webMcpTools() {
       description:
         "Use this read-only tool at the start of a HANDOFF session to inspect the live case queue, unread flags, severity, status, and refund state. Do not use it to change a case or infer full case details; call get_case for a specific case before acting.",
       inputSchema: schema({}),
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, untrustedContentHint: true },
       execute: handleGetWorkspace,
     },
     {
@@ -625,9 +1022,9 @@ function webMcpTools() {
       description:
         "Use this read-only tool first for the judge demo case: call get_case with case_id CASE-1042, then draft_customer_reply with tone apologetic, then propose_refund with amount_usd 2388, then issue_refund, then send_customer_reply. Do not use it to modify state; choose an update or proposal tool for changes.",
       inputSchema: schema({
-        case_id: { type: "string", description: "Case identifier such as CASE-1042." },
+        case_id: caseIdParam(),
       }, ["case_id"]),
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, untrustedContentHint: true },
       execute: handleGetCase,
     },
     {
@@ -635,7 +1032,7 @@ function webMcpTools() {
       description:
         "Use this tool to update a case workflow status after you have enough context and can explain why in a note. Do not use it for money movement, sending customer replies, on-call paging, or resolving a gated case; those have dedicated approval tools.",
       inputSchema: schema({
-        case_id: { type: "string", description: "Case identifier such as CASE-1042." },
+        case_id: caseIdParam(),
         status: {
           type: "string",
           enum: STATUS_OPTIONS,
@@ -643,9 +1040,11 @@ function webMcpTools() {
         },
         note: {
           type: "string",
+          maxLength: 240,
           description: "Short operational note explaining why the status changed.",
         },
       }, ["case_id", "status", "note"]),
+      annotations: { readOnlyHint: false, untrustedContentHint: true },
       execute: handleUpdateCaseStatus,
     },
     {
@@ -653,14 +1052,15 @@ function webMcpTools() {
       description:
         "Use this tool to add an agent-authored note to the current case timeline for human review. Public-to-customer visibility means the note is customer-visible context only; it never sends a customer message. Do not use this tool to send replies or change money state.",
       inputSchema: schema({
-        case_id: { type: "string", description: "Case identifier such as CASE-1042." },
-        body: { type: "string", description: "Comment body to add to the timeline." },
+        case_id: caseIdParam(),
+        body: { type: "string", maxLength: 800, description: "Comment body to add to the timeline." },
         visibility: {
           type: "string",
           enum: ["public_to_customer", "internal"],
           description: "Whether this is internal context or a customer-visible note. Neither option sends a reply.",
         },
       }, ["case_id", "body", "visibility"]),
+      annotations: { readOnlyHint: false, untrustedContentHint: true },
       execute: handleAddComment,
     },
     {
@@ -668,23 +1068,25 @@ function webMcpTools() {
       description:
         "Use this tool after get_case for CASE-1042 to create or replace a visible customer reply draft. For the judge demo, pass tone apologetic and a goal that apologizes for the duplicate charge and explains the refund path; then call propose_refund with amount_usd 2388. This tool does not send anything.",
       inputSchema: schema({
-        case_id: { type: "string", description: "Case identifier such as CASE-1042." },
-        goal: { type: "string", description: "Goal for the reply, such as apologize and explain the refund path." },
+        case_id: caseIdParam(),
+        goal: { type: "string", maxLength: 240, description: "Goal for the reply, such as apologize and explain the refund path." },
         tone: {
           type: "string",
           enum: ["calm", "apologetic", "firm"],
           description: "Reply tone.",
         },
       }, ["case_id", "goal", "tone"]),
+      annotations: { readOnlyHint: false, untrustedContentHint: true },
       execute: handleDraftCustomerReply,
     },
     {
       name: "send_customer_reply",
       description:
-        "Use this destructive tool at the end of the judge sequence after get_case, draft_customer_reply, propose_refund, and issue_refund have completed. It opens a visible human approval gate and waits for Jordan; no customer reply is sent unless Jordan approves. Do not use it to draft, edit, or add internal comments.",
+        "Use this destructive tool at the end of the judge sequence after get_case, draft_customer_reply, propose_refund, and issue_refund have completed. Do not call it before a draft exists or before refund approval is complete. It opens a visible human approval gate and waits for Jordan; no customer reply is sent unless Jordan approves.",
       inputSchema: schema({
-        case_id: { type: "string", description: "Case identifier such as CASE-1042." },
+        case_id: caseIdParam(),
       }, ["case_id"]),
+      annotations: { readOnlyHint: false, untrustedContentHint: true },
       execute: handleSendCustomerReply,
     },
     {
@@ -692,19 +1094,21 @@ function webMcpTools() {
       description:
         "Use this tool after drafting the CASE-1042 customer reply to propose amount_usd 2388 for the duplicate Pro Annual charge. It creates a visible pending approval and does not move money by itself; then call issue_refund to open the human approval gate.",
       inputSchema: schema({
-        case_id: { type: "string", description: "Case identifier such as CASE-1042." },
-        amount_usd: { type: "number", minimum: 0, description: "Refund amount in USD." },
-        reason: { type: "string", description: "Operational reason for the proposed refund." },
+        case_id: caseIdParam(),
+        amount_usd: { type: "number", minimum: 0, maximum: 10000, description: "Refund amount in USD. For CASE-1042 use 2388." },
+        reason: { type: "string", maxLength: 240, description: "Operational reason for the proposed refund." },
       }, ["case_id", "amount_usd", "reason"]),
+      annotations: { readOnlyHint: false, untrustedContentHint: true },
       execute: handleProposeRefund,
     },
     {
       name: "issue_refund",
       description:
-        "Use this destructive tool after propose_refund in the judge sequence for CASE-1042. It opens a visible 'Refund $2,388 to Maya Chen?' approval gate and waits for Jordan; the refund state does not change to issued unless Jordan approves. After approval, call send_customer_reply.",
+        "Use this destructive tool after propose_refund in the judge sequence for CASE-1042. Do not call it before a refund has been proposed. It opens a visible 'Refund $2,388 to Maya Chen?' approval gate and waits for Jordan; the refund state does not change to issued unless Jordan approves. After approval, call send_customer_reply.",
       inputSchema: schema({
-        case_id: { type: "string", description: "Case identifier such as CASE-1042." },
+        case_id: caseIdParam(),
       }, ["case_id"]),
+      annotations: { readOnlyHint: false, untrustedContentHint: true },
       execute: handleIssueRefund,
     },
     {
@@ -712,9 +1116,10 @@ function webMcpTools() {
       description:
         "Use this destructive tool only when billing-primary or incident response needs to be interrupted for the case. It requests human approval and does not page until approved. Do not use it for routine notes, status changes, or customer replies.",
       inputSchema: schema({
-        case_id: { type: "string", description: "Case identifier such as CASE-1042." },
-        message: { type: "string", description: "Concise page message for billing-primary." },
+        case_id: caseIdParam(),
+        message: { type: "string", maxLength: 160, description: "Concise page message for billing-primary." },
       }, ["case_id", "message"]),
+      annotations: { readOnlyHint: false, untrustedContentHint: true },
       execute: handlePageOncall,
     },
     {
@@ -722,7 +1127,7 @@ function webMcpTools() {
       description:
         "Use this read-only tool to inspect all pending human approval gates across HANDOFF. Do not use it to approve, reject, or apply side effects; the human must approve in the UI.",
       inputSchema: schema({}),
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, untrustedContentHint: true },
       execute: handleListPendingApprovals,
     },
     {
@@ -730,12 +1135,65 @@ function webMcpTools() {
       description:
         "Use this destructive tool only when the case is truly ready to close and you can provide a concise resolution summary. It requires human approval and refuses to resolve a P1 with an unissued requested refund pending. Do not use it while customer, refund, or on-call work remains unresolved.",
       inputSchema: schema({
-        case_id: { type: "string", description: "Case identifier such as CASE-1042." },
-        resolution_summary: { type: "string", description: "Short summary of the final resolution." },
+        case_id: caseIdParam(),
+        resolution_summary: { type: "string", maxLength: 240, description: "Short summary of the final resolution." },
       }, ["case_id", "resolution_summary"]),
+      annotations: { readOnlyHint: false, untrustedContentHint: true },
       execute: handleResolveCase,
     },
+    {
+      name: "get_session",
+      description:
+        "Use this read-only tool to inspect the live agent session for CASE-1042: session id, owner, watchers, status, elapsed time, agent state, and current plan step. Use it before redirect_agent or handoff_session so you know who is steering.",
+      inputSchema: schema({}),
+      annotations: { readOnlyHint: true, untrustedContentHint: true },
+      execute: handleGetSession,
+    },
+    {
+      name: "list_watchers",
+      description:
+        "Use this read-only tool to list teammates watching SES-1042 without changing ownership. If Sam is absent, the human can click Join as Sam or the session can later be handed off to Sam.",
+      inputSchema: schema({}),
+      annotations: { readOnlyHint: true, untrustedContentHint: true },
+      execute: handleListWatchers,
+    },
+    {
+      name: "redirect_agent",
+      description:
+        "Use this session-control tool when the active human wants to steer Handoff with a short instruction. It updates SES-1042 to redirected and writes a timeline event, but it does not approve refunds, send replies, or page anyone.",
+      inputSchema: schema({
+        instruction: {
+          type: "string",
+          maxLength: 180,
+          description: "Short steering instruction for the live agent session.",
+        },
+      }, ["instruction"]),
+      annotations: { readOnlyHint: false, untrustedContentHint: true },
+      execute: handleRedirectAgent,
+    },
+    {
+      name: "handoff_session",
+      description:
+        "Use this session-control tool to transfer ownership of SES-1042 between Jordan and Sam. It changes the live session owner and writes a timeline event; it does not approve money movement or send customer replies.",
+      inputSchema: schema({
+        to_participant: {
+          type: "string",
+          enum: ["sam", "jordan"],
+          description: "Participant who should become the live session owner.",
+        },
+      }, ["to_participant"]),
+      annotations: { readOnlyHint: false, untrustedContentHint: true },
+      execute: handleHandoffSession,
+    },
   ];
+}
+
+function caseIdParam() {
+  return {
+    type: "string",
+    pattern: "^CASE-[0-9]{4}$",
+    description: "Case identifier such as CASE-1042.",
+  };
 }
 
 function schema(properties, required = []) {
@@ -767,6 +1225,10 @@ async function runTool(tool, input, client) {
 
 function setAgentWorking(isWorking) {
   els.agentPulse.hidden = !isWorking;
+  if (state.session) {
+    state.session.agentState = isWorking ? "working" : "idle";
+    renderPresenceRail();
+  }
 }
 
 function recordToolCall(name, args, resultText) {
@@ -863,6 +1325,8 @@ function handleDraftCustomerReply({ case_id, goal, tone }) {
   if (targetCase.status === "open") {
     targetCase.status = "in_progress";
   }
+  getSession().currentStepId = "propose_refund";
+  getSession().status = "running";
   const article = tone === "apologetic" ? "an" : "a";
   addTimeline(targetCase, {
     actor: "agent",
@@ -903,6 +1367,9 @@ function handleProposeRefund({ case_id, amount_usd, reason }) {
   targetCase.refund.requestedAmount = amount_usd;
   targetCase.refund.reason = reason;
   targetCase.status = "refund_pending";
+  getSession().status = "waiting_on_human";
+  getSession().currentStepId = "wait_human";
+  getSession().agentState = "idle";
   const approval = createOrReuseApproval({
     case_id,
     kind: "issue_refund",
@@ -968,6 +1435,25 @@ function handleListPendingApprovals() {
   return textResult(JSON.stringify(state.pendingApprovals, null, 2));
 }
 
+function handleGetSession() {
+  return textResult(JSON.stringify(sessionSnapshot(), null, 2));
+}
+
+function handleListWatchers() {
+  return textResult(JSON.stringify(sessionSnapshot().watchers, null, 2));
+}
+
+function handleRedirectAgent({ instruction }) {
+  return textResult(redirectAgentSession(instruction || "", getSession().owner, "redirect_agent"));
+}
+
+function handleHandoffSession({ to_participant }) {
+  if (!PARTICIPANTS[to_participant]) {
+    return textResult("Error: to_participant must be sam or jordan.");
+  }
+  return textResult(handoffSessionTo(to_participant, "handoff_session"));
+}
+
 async function handleResolveCase({ case_id, resolution_summary }, client) {
   const targetCase = requireCase(case_id);
   const unresolvedRefund =
@@ -1024,6 +1510,9 @@ function createOrReuseApproval({ case_id, kind, payload }) {
 }
 
 function waitForVisibleHumanApproval(client, message, approvalId) {
+  const session = getSession();
+  session.status = "waiting_on_human";
+  session.currentStepId = "wait_human";
   const approvalPromise = new Promise((resolve) => {
     approvalWaiters.set(approvalId, resolve);
   });
@@ -1087,6 +1576,7 @@ function approveApproval(approvalId) {
     });
     targetCase.replySentAt = new Date().toISOString();
     targetCase.status = targetCase.refund.state === "issued" ? "refunded" : "waiting_on_customer";
+    getSession().status = "running";
     finishApprovalWaiter(approvalId, {
       approved: true,
       resultText: `Human approved send_reply. Reply sent to ${targetCase.customer.name}.`,
@@ -1098,6 +1588,7 @@ function approveApproval(approvalId) {
     targetCase.refund.issuedAt = new Date().toISOString();
     targetCase.refund.requestedAmount = approval.payload.amount_usd;
     targetCase.status = "refunded";
+    getSession().status = "running";
     addTimeline(targetCase, {
       actor: "agent",
       text: `Ledger event: issued ${formatMoney(approval.payload.amount_usd)} refund to ${targetCase.customer.name}.`,
@@ -1111,6 +1602,7 @@ function approveApproval(approvalId) {
   }
 
   if (approval.kind === "page_oncall") {
+    getSession().status = "running";
     addTimeline(targetCase, {
       actor: "agent",
       text: `Paged on-call: billing-primary. ${approval.payload.message}`,
@@ -1125,6 +1617,7 @@ function approveApproval(approvalId) {
 
   if (approval.kind === "resolve_case") {
     targetCase.status = "resolved";
+    getSession().status = "running";
     addTimeline(targetCase, {
       actor: "agent",
       text: `Resolved case. ${approval.payload.resolution_summary}`,
@@ -1151,6 +1644,7 @@ function rejectApproval(approvalId) {
     targetCase.refund.state = "rejected";
     targetCase.status = "open";
   }
+  getSession().status = "running";
   addTimeline(targetCase, {
     actor: "human",
     text: `Rejected agent request: ${approvalSummary(approval)}`,
@@ -1234,6 +1728,10 @@ function formatStatus(status) {
   return status.replaceAll("_", " ");
 }
 
+function formatSessionStatus(status) {
+  return status.replaceAll("_", " ");
+}
+
 function formatRefund(refundState) {
   return refundState.replaceAll("_", " ");
 }
@@ -1269,21 +1767,17 @@ function escapeHtml(value) {
 }
 
 function getModelContext() {
-  const documentContext =
-    typeof document !== "undefined" ? document.modelContext : null;
-  const navigatorContext =
-    typeof navigator !== "undefined" ? navigator.modelContext : null;
-  return documentContext || navigatorContext || null;
+  if (typeof document === "undefined" || typeof navigator === "undefined") {
+    return null;
+  }
+  const modelContext = document.modelContext || navigator.modelContext;
+  return modelContext || null;
 }
 
 function exposeJudgeApi() {
   const judgeApi = {
     call(name, input = {}, client = {}) {
-      const tool = webMcpTools().find((item) => item.name === name);
-      if (!tool) {
-        throw new Error(`Unknown HANDOFF tool: ${name}`);
-      }
-      return runTool(tool, input, client);
+      return callLocalTool(name, input, client);
     },
     get lastToolCall() {
       return state.toolCalls[0] || null;
@@ -1303,7 +1797,7 @@ function exposeJudgeApi() {
           tool.name,
           {
             ...tool,
-            execute: (input = {}, client = {}) => runTool(tool, input, client),
+            execute: (input = {}, client = {}) => callLocalTool(tool.name, input, client),
           },
         ]),
       );
